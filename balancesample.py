@@ -1,0 +1,645 @@
+# -*- coding: utf-8 -*-
+"""
+滑坡预测样本平衡系统 v4.3（时间完全匹配版）
+负样本与正样本时间分布完全一致，模拟同场降雨条件
+"""
+import os
+import pandas as pd
+import geopandas as gpd
+import numpy as np
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from geopy.distance import geodesic
+import warnings
+warnings.filterwarnings('ignore')
+
+# 指定中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ---------------------------- 配置参数 ----------------------------
+BASE_DIR = r'E:/怀化市地质灾害攻关/样本数据/全市含降雨时间样本'
+DATA_PATH = r'E:/怀化市地质灾害攻关/陈红专提供数据/全市正样本.csv' 
+BOUNDARY_PATH = 'E:/怀化市地质灾害攻关/约束数据/怀化市行政边界.shp'
+VULNERABILITY_PATH = 'E:/怀化市地质灾害攻关/约束数据/易发性分区.shp' 
+MIN_DISTANCE = 100  # 最小样本间距(米)
+RANDOM_STATE = 42   # 随机种子
+TARGET_RATIOS = [2,3,4,5,8,10]  # 只处理1:1比例
+
+# 基本字段
+BASIC_COLUMNS = ['id', 'lon', 'lat', '日期', 'target']
+
+# ---------------------------- 核心函数 ----------------------------
+def load_data():
+    """数据加载与验证"""
+    data = pd.read_csv(DATA_PATH, encoding='gbk', parse_dates=['日期'])
+    admin = gpd.read_file(BOUNDARY_PATH) 
+    vulnerability = gpd.read_file(VULNERABILITY_PATH)
+    
+    # 检查基本字段
+    missing_cols = [c for c in BASIC_COLUMNS if c not in data.columns]
+    if missing_cols:
+        raise ValueError(f"缺失必要字段: {missing_cols}")
+    
+    return data, admin, vulnerability
+
+
+def analyze_time_distribution(data):
+    """分析正样本的时间分布特征"""
+    print("\n📊 正样本时间分布分析:")
+    
+    # 确保日期为datetime类型
+    data['日期'] = pd.to_datetime(data['日期'])
+    
+    # 提取时间特征
+    data['年'] = data['日期'].dt.year
+    data['月'] = data['日期'].dt.month
+    data['季节'] = data['日期'].dt.month % 12 // 3 + 1  # 1:春, 2:夏, 3:秋, 4:冬
+    data['星期'] = data['日期'].dt.dayofweek  # 0:周一, 6:周日
+    
+    # 统计年分布
+    year_dist = data['年'].value_counts().sort_index()
+    print(f"  年份分布: {dict(year_dist)}")
+    
+    # 统计月分布
+    month_dist = data['月'].value_counts().sort_index()
+    print(f"  月份分布: {dict(month_dist)}")
+    
+    # 统计季节分布
+    season_labels = {1: '春季', 2: '夏季', 3: '秋季', 4: '冬季'}
+    season_dist = data['季节'].value_counts().sort_index()
+    season_dist_named = {season_labels[k]: v for k, v in season_dist.items()}
+    print(f"  季节分布: {season_dist_named}")
+    
+    # 统计星期分布
+    week_labels = {0: '周一', 1: '周二', 2: '周三', 3: '周四', 4: '周五', 5: '周六', 6: '周日'}
+    week_dist = data['星期'].value_counts().sort_index()
+    week_dist_named = {week_labels[k]: v for k, v in week_dist.items()}
+    print(f"  星期分布: {week_dist_named}")
+    
+    # 计算时间分布统计量
+    time_features = {
+        'year_dist': {int(k): int(v) for k, v in year_dist.to_dict().items()},
+        'month_dist': {int(k): int(v) for k, v in month_dist.to_dict().items()},
+        'season_dist': {int(k): int(v) for k, v in season_dist.to_dict().items()},
+        'week_dist': {int(k): int(v) for k, v in week_dist.to_dict().items()},
+        'date_list': data['日期'].tolist(),  # 保存所有正样本日期
+        'date_range': (data['日期'].min(), data['日期'].max()),
+        'total_samples': len(data)
+    }
+    
+    return time_features
+
+
+def filter_in_boundary(data, admin, vulnerability):
+    """空间边界过滤和易发性指数过滤"""
+    gdf = gpd.GeoDataFrame(
+        data,
+        geometry=gpd.points_from_xy(data['lon'], data['lat']),
+        crs=admin.crs
+    )
+    # 空间边界过滤
+    boundary_filtered = gpd.sjoin(gdf, admin, how='inner', predicate='within').drop(columns=['index_right'])
+    # 易发性指数过滤，只保留fenji为2和3的数据
+    vulnerability_filtered = vulnerability[(vulnerability['fenji'] == 2) | (vulnerability['fenji'] == 3)]
+    if boundary_filtered.crs != vulnerability_filtered.crs:
+        vulnerability_filtered = vulnerability_filtered.to_crs(boundary_filtered.crs)
+    final_filtered = gpd.sjoin(boundary_filtered, vulnerability_filtered, how='inner', predicate='within').drop(columns=['index_right'])
+    return final_filtered
+
+
+def check_min_distance(new_points, existing_points, min_dist):
+    """精确距离检查"""
+    for new_pt in new_points:
+        for exist_pt in existing_points:
+            try:
+                if geodesic((new_pt[1], new_pt[0]), (exist_pt[1], exist_pt[0])).m < min_dist:
+                    return False
+            except:
+                continue
+    return True
+
+
+def balance_samples(valid_pos, admin, vulnerability, time_features, ratio=1):
+    """完全时间匹配的平衡样本生成"""
+    # ================= 初始化校验 =================
+    if valid_pos.empty:
+        raise ValueError("正样本数据为空")
+    if 'geometry' not in admin.columns:
+        admin = admin.set_geometry('geometry')
+    if admin.crs != vulnerability.crs:
+        vulnerability = vulnerability.to_crs(admin.crs)
+    
+    n_pos = len(valid_pos)  # 获取正样本数量
+    n_neg = int(n_pos * ratio)  # 根据比例计算负样本数量
+    
+    # ================= 生成候选负样本点 =================
+    vul_zones = vulnerability[vulnerability['fenji'].isin([2, 3])]
+    
+    if vul_zones.empty:
+        raise ValueError("在易发性分区中未找到等级为2或3的区域")
+    
+    candidate_points = [] 
+
+    # 生成更多候选点以确保足够数量
+    np.random.seed(RANDOM_STATE)
+    max_attempts = n_neg * 20  # 增加尝试次数
+    attempts = 0
+    
+    while len(candidate_points) < n_neg * 5 and attempts < max_attempts:  # 生成5倍候选点
+        zone = vul_zones.sample(1).geometry.iloc[0]
+        if zone.is_empty:
+            attempts += 1
+            continue
+            
+        minx, miny, maxx, maxy = zone.bounds
+        lon = np.random.uniform(minx, maxx)
+        lat = np.random.uniform(miny, maxy)
+        point = gpd.points_from_xy([lon], [lat])[0]
+        
+        # 检查点是否在区域内
+        try:
+            if zone.contains(point):
+                candidate_points.append((lon, lat))
+        except:
+            pass
+        
+        attempts += 1
+
+    if not candidate_points:
+        raise ValueError("无法生成候选负样本点")
+    
+    # 转换为GeoDataFrame并去重
+    candidate_gdf = gpd.GeoDataFrame(
+        {'lon': [p[0] for p in candidate_points], 'lat': [p[1] for p in candidate_points]},
+        geometry=gpd.points_from_xy([p[0] for p in candidate_points], [p[1] for p in candidate_points]),
+        crs=admin.crs
+    ).drop_duplicates(subset=['lon', 'lat'])
+    
+    # 随机抽样并进行距离检查
+    np.random.seed(RANDOM_STATE)
+    valid_neg = []
+    existing_points = valid_pos[['lon', 'lat']].values.tolist()
+    candidate_list = candidate_gdf[['lon', 'lat']].values.tolist()
+    
+    # 优先选择距离正样本足够远的点
+    for pt in candidate_list:
+        if check_min_distance([pt], existing_points, MIN_DISTANCE):
+            valid_neg.append(pt)
+            if len(valid_neg) >= n_neg:
+                break
+    
+    # 如果候选点不足，放宽条件（先满足数量再检查距离）
+    if len(valid_neg) < n_neg:
+        print(f"警告：仅找到{len(valid_neg)}个满足距离条件的点，目标需要{n_neg}个")
+        print(f"将补充一些距离可能不足的点")
+        # 补充一些点，即使距离可能不足
+        for pt in candidate_list:
+            if pt not in valid_neg:
+                valid_neg.append(pt)
+                if len(valid_neg) >= n_neg:
+                    break
+    
+    # 转换为DataFrame - 只包含基本字段
+    valid_neg = pd.DataFrame(valid_neg[:n_neg], columns=['lon', 'lat'])  # 只取需要的数量
+    valid_neg['target'] = 0
+
+    # ================= 分配完全匹配的日期 =================
+    print(f"   正在为正样本分配完全相同的日期分布...")
+    
+    # 方法：从正样本的日期中直接抽样（有放回），确保时间分布完全相同
+    pos_dates = time_features['date_list']
+    
+    if len(pos_dates) > 0:
+        # 使用有放回抽样，确保负样本日期分布与正样本完全相同
+        valid_neg['日期'] = np.random.choice(pos_dates, size=len(valid_neg), replace=True)
+    else:
+        raise ValueError("正样本中没有有效日期数据")
+    
+    # 检查时间分布是否匹配
+    pos_month_dist = pd.Series([d.month for d in pos_dates]).value_counts(normalize=True).sort_index()
+    neg_month_dist = pd.Series([d.month for d in valid_neg['日期']]).value_counts(normalize=True).sort_index()
+    
+    print(f"   正样本月份分布: {dict(pos_month_dist)}")
+    print(f"   负样本月份分布: {dict(neg_month_dist)}")
+    
+    # ================= 分配ID =================
+    # 负样本ID为负数，从-1开始递减
+    valid_neg['id'] = -np.arange(1, len(valid_neg) + 1)
+    
+    # ================= 数据合并 =================
+    # 只保留基本字段
+    basic_cols = ['id', 'lon', 'lat', '日期', 'target']
+    
+    # 确保正样本也只包含这些字段（如果有多余字段）
+    pos_basic = valid_pos[basic_cols].copy() if all(col in valid_pos.columns for col in basic_cols) else valid_pos
+    
+    # 合并正负样本
+    balanced = pd.concat([
+        pos_basic,
+        valid_neg[basic_cols]
+    ], ignore_index=True)
+    
+    # 打乱顺序
+    return balanced.sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
+
+
+def plot_comparison(original, balanced, admin, vulnerability, save_path, ratio):
+    """增强版对比可视化（包含时间分布对比）"""
+    # 获取时间范围
+    time_range = ""
+    if not original.empty and '日期' in original:
+        try:
+            min_date = original['日期'].min().strftime('%Y-%m-%d')
+            max_date = original['日期'].max().strftime('%Y-%m-%d')
+            time_range = f"{min_date} 至 {max_date}"
+        except AttributeError:
+            time_range = "日期格式错误"
+    
+    # 计算实际比例
+    orig_pos = original[original['target']==1]
+    orig_neg = original[original['target']==0]
+    bal_pos = balanced[balanced['target']==1]
+    bal_neg = balanced[balanced['target']==0]
+    actual_ratio = len(bal_neg)/len(bal_pos) if len(bal_pos) > 0 else 0
+    
+    # 创建标题
+    main_title = f"滑坡风险样本时空平衡对比（时间完全匹配）\n时间范围: {time_range}\n目标比例 1:{ratio} | 实际比例 1:{actual_ratio:.1f}"
+
+    # 统一坐标系为WGS84
+    target_crs = "EPSG:4326"
+    admin = admin.to_crs(target_crs)
+    vulnerability = vulnerability.to_crs(target_crs)
+
+    # 创建图形 - 2行2列布局
+    fig = plt.figure(figsize=(20, 16), dpi=150)
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.2, 1])
+    
+    # 空间分布子图
+    ax1 = fig.add_subplot(gs[0, 0], projection=ccrs.PlateCarree())
+    ax2 = fig.add_subplot(gs[0, 1], projection=ccrs.PlateCarree())
+    
+    # 时间分布子图
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax4 = fig.add_subplot(gs[1, 1])
+
+    # 获取安全绘图范围
+    x_range, y_range = get_safe_plot_range(admin)
+
+    # --- 绘制原始空间分布 ---
+    plot_base_map(
+        ax=ax1,
+        admin=admin,
+        vulnerability=vulnerability,
+        x_range=x_range,
+        y_range=y_range,
+        show_yf_legend=False
+    )
+    plot_samples(ax1, orig_neg, 'blue', '负样本')
+    plot_samples(ax1, orig_pos, 'red', '正样本')
+    ax1.set_title(f"原始空间分布 (1:{len(orig_neg)/len(orig_pos):.1f})", fontsize=12)
+
+    # --- 绘制平衡后空间分布 ---
+    plot_base_map(
+        ax=ax2,
+        admin=admin,
+        vulnerability=vulnerability,
+        x_range=x_range,
+        y_range=y_range,
+        show_yf_legend=True
+    )
+    plot_samples(ax2, bal_neg, 'blue', '负样本')
+    plot_samples(ax2, bal_pos, 'red', '正样本')
+    ax2.set_title(f"平衡后空间分布 (目标1:{ratio} | 实际1:{actual_ratio:.1f})", fontsize=12)
+
+    # --- 绘制时间分布对比 ---
+    # 月份分布对比
+    if '日期' in bal_pos.columns and '日期' in bal_neg.columns:
+        # 提取月份
+        bal_pos_dates = pd.to_datetime(bal_pos['日期'])
+        bal_neg_dates = pd.to_datetime(bal_neg['日期'])
+        
+        # 获取所有出现的月份
+        all_months = sorted(set(bal_pos_dates.dt.month).union(set(bal_neg_dates.dt.month)))
+        
+        if all_months:
+            pos_month_counts = [len(bal_pos_dates[bal_pos_dates.dt.month == m]) for m in all_months]
+            neg_month_counts = [len(bal_neg_dates[bal_neg_dates.dt.month == m]) for m in all_months]
+            
+            # 月份标签映射
+            month_labels_map = {
+                1: '1月', 2: '2月', 3: '3月', 4: '4月', 5: '5月', 6: '6月',
+                7: '7月', 8: '8月', 9: '9月', 10: '10月', 11: '11月', 12: '12月'
+            }
+            month_labels = [month_labels_map.get(m, f'{m}月') for m in all_months]
+            
+            width = 0.35
+            x_positions = np.arange(len(all_months))
+            ax3.bar(x_positions - width/2, pos_month_counts, width, 
+                    label='正样本', color='red', alpha=0.7)
+            ax3.bar(x_positions + width/2, neg_month_counts, width, 
+                    label='负样本', color='blue', alpha=0.7)
+            ax3.set_xlabel('月份')
+            ax3.set_ylabel('样本数')
+            ax3.set_title('正负样本月份分布对比')
+            ax3.set_xticks(x_positions)
+            ax3.set_xticklabels(month_labels, rotation=45)
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+            
+            # 计算并显示匹配度
+            total_pos = sum(pos_month_counts)
+            total_neg = sum(neg_month_counts)
+            
+            # 计算分布相似度
+            pos_props = [c/total_pos for c in pos_month_counts]
+            neg_props = [c/total_neg for c in neg_month_counts]
+            mse = np.mean([(p-n)**2 for p, n in zip(pos_props, neg_props)])
+            
+            # 在图上添加匹配度文本
+            ax3.text(0.02, 0.95, f'分布MSE: {mse:.4f}', transform=ax3.transAxes, 
+                    fontsize=10, verticalalignment='top', 
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        else:
+            ax3.text(0.5, 0.5, '无月份数据', ha='center', va='center')
+            ax3.set_title('月份分布对比')
+    
+    # 年份分布对比
+    if '日期' in bal_pos.columns and '日期' in bal_neg.columns:
+        bal_pos_dates = pd.to_datetime(bal_pos['日期'])
+        bal_neg_dates = pd.to_datetime(bal_neg['日期'])
+        
+        all_years = sorted(set(bal_pos_dates.dt.year).union(set(bal_neg_dates.dt.year)))
+        
+        if all_years:
+            pos_year_counts = [len(bal_pos_dates[bal_pos_dates.dt.year == y]) for y in all_years]
+            neg_year_counts = [len(bal_neg_dates[bal_neg_dates.dt.year == y]) for y in all_years]
+            
+            width = 0.35
+            x_positions = np.arange(len(all_years))
+            ax4.bar(x_positions - width/2, pos_year_counts, width, 
+                    label='正样本', color='red', alpha=0.7)
+            ax4.bar(x_positions + width/2, neg_year_counts, width, 
+                    label='负样本', color='blue', alpha=0.7)
+            ax4.set_xlabel('年份')
+            ax4.set_ylabel('样本数')
+            ax4.set_title('正负样本年份分布对比')
+            ax4.set_xticks(x_positions)
+            ax4.set_xticklabels([str(y) for y in all_years], rotation=45)
+            ax4.legend()
+            ax4.grid(True, alpha=0.3)
+        else:
+            ax4.text(0.5, 0.5, '无年份数据', ha='center', va='center')
+            ax4.set_title('年份分布对比')
+    
+    # --- 全局设置 ---
+    plt.suptitle(main_title, fontsize=14, y=0.98)
+    plt.tight_layout()
+
+    # 保存图像
+    try:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"📊 对比图已保存: {save_path}")
+    except Exception as e:
+        print(f"⚠️ 保存图片时出错: {str(e)}")
+        plt.close()
+
+
+def plot_base_map(ax, admin, vulnerability, x_range, y_range, show_yf_legend):
+    """绘制底图（含易发性指数）"""
+    # 易发性指数颜色映射（1-3级）
+    yf_colors = {
+        1: '#B4E8D8',  # 低易发
+        2: '#F9D56E',  # 中易发 
+        3: '#F38181'   # 高易发
+    }
+    yf_labels = {
+        1: '低易发区',
+        2: '中易发区', 
+        3: '高易发区'
+    }
+    # 绘制易发性指数（按等级排序确保图例顺序一致）
+    for yf_class in sorted(vulnerability['fenji'].unique()):
+        if yf_class in yf_colors:  # 只处理1-3级
+            layer = vulnerability[vulnerability['fenji'] == yf_class]
+            layer.plot(ax=ax, color=yf_colors[yf_class], 
+                      edgecolor='none', alpha=0.7,
+                      label=yf_labels[yf_class])
+
+    # 行政边界
+    admin.plot(ax=ax, color='none', edgecolor='black', linewidth=0.8, zorder=10)
+    
+    # 易发性图例（仅右侧子图显示）
+    if show_yf_legend:
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor=yf_colors[i], edgecolor='none', label=yf_labels[i])
+            for i in sorted(yf_colors.keys())
+        ]
+        # 显式传递图例参数
+        ax.legend(
+            handles=legend_elements,
+            title='滑坡易发性等级',
+            loc='lower right',
+            framealpha=1,
+            fontsize=9
+        )
+    
+    # 设置范围
+    ax.set_xlim(x_range)
+    ax.set_ylim(y_range)
+    ax.set_aspect('auto')
+    
+    # 添加地图要素
+    ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='none', edgecolor='gray', alpha=0.3)
+    gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5)
+    gl.top_labels = False
+    gl.right_labels = False
+
+
+def plot_samples(ax, data, color, label):
+    """绘制样本点"""
+    if not data.empty:
+        # 添加标签过滤逻辑
+        plot_label = label if label not in ['_nolegend_', ''] else None
+        marker = '^' if '正' in label else 'o'
+        
+        # 使用matplotlib原生绘图方式
+        ax.scatter(
+            data['lon'], 
+            data['lat'],
+            c=color,
+            s=40 if '正' in label else 20,
+            marker='^' if '正' in label else 'o',
+            edgecolors='white',
+            linewidths=0.8,
+            label=plot_label,  # 可能为None
+            zorder=5,
+            transform=ccrs.PlateCarree()
+        )
+        
+        # 创建自定义图例句柄
+        handle = plt.Line2D(
+            [0], [0],
+            marker=marker,
+            color='w',
+            markerfacecolor=color,
+            markersize=10,
+            markeredgecolor='white'
+        )
+        ax.legend(
+            handles=[handle],
+            labels=[f'{label} (n={len(data)})'],
+            loc='upper left',
+            framealpha=1,
+            fontsize=10
+        )
+
+
+def get_safe_plot_range(admin_gdf, padding_ratio=0.15):
+    """获取安全绘图范围"""
+    bounds = admin_gdf.total_bounds
+    x_min, y_min, x_max, y_max = bounds
+    
+    # 处理异常范围
+    width = max(x_max - x_min, 0.02)  # 最小约2公里
+    height = max(y_max - y_min, 0.02)
+    
+    padding = max(width, height) * padding_ratio
+    return (x_min - padding, x_max + padding), (y_min - padding, y_max + padding)
+
+
+# ---------------------------- 主流程 ----------------------------
+def main():
+    print("=== 滑坡预测样本平衡系统（时间完全匹配版）===")
+    print(f"目标比例列表: {[f'1:{r}' for r in TARGET_RATIOS]}\n")
+    print("说明：负样本与正样本时间分布完全一致，模拟同场降雨条件下可能发生滑坡也可能不发生滑坡的情况")
+    
+    # 数据准备
+    data, admin, vulnerability = load_data()
+    
+    # 统一坐标系
+    target_crs = "EPSG:4326"
+    admin = admin.to_crs(target_crs)
+    vulnerability = vulnerability.to_crs(target_crs)
+    
+    # 空间过滤
+    filtered = filter_in_boundary(data, admin, vulnerability)
+    valid_pos = filtered[filtered['target'] == 1]
+    orig_neg = filtered[filtered['target'] == 0]
+    orig_ratio = len(orig_neg) / len(valid_pos) if len(valid_pos) > 0 else 0
+    
+    print(f"📌 初始数据统计:")
+    print(f"   正样本数量: {len(valid_pos)}")
+    print(f"   负样本数量: {len(orig_neg)}")
+    print(f"   当前比例: 1:{orig_ratio:.1f}")
+    print(f"   数据时间范围: {valid_pos['日期'].min()} 至 {valid_pos['日期'].max()}")
+    
+    # 分析正样本时间分布特征
+    time_features = analyze_time_distribution(valid_pos)
+    
+    # 创建结果目录
+    os.makedirs(BASE_DIR, exist_ok=True)
+    
+    # 多比例处理
+    for ratio in TARGET_RATIOS:
+        ratio_str = f"1_{ratio}"
+        print(f"\n🔧 正在处理比例 1:{ratio}...")
+        
+        try:
+            # 平衡采样（时间完全匹配）
+            balanced_data = balance_samples(valid_pos, admin, vulnerability, time_features, ratio)
+            
+            # 检查样本数量
+            pos_count = len(balanced_data[balanced_data['target']==1])
+            neg_count = len(balanced_data[balanced_data['target']==0])
+            print(f"   平衡后: 正样本={pos_count}, 负样本={neg_count}")
+            
+            # 详细时间匹配分析
+            if '日期' in balanced_data.columns:
+                pos_dates = pd.to_datetime(balanced_data[balanced_data['target']==1]['日期'])
+                neg_dates = pd.to_datetime(balanced_data[balanced_data['target']==0]['日期'])
+                
+                # 月份分布
+                pos_month_counts = pos_dates.dt.month.value_counts().sort_index()
+                neg_month_counts = neg_dates.dt.month.value_counts().sort_index()
+                
+                print(f"\n   时间匹配分析:")
+                print(f"     正样本月份分布: {dict(pos_month_counts)}")
+                print(f"     负样本月份分布: {dict(neg_month_counts)}")
+                
+                # 年份分布
+                pos_year_counts = pos_dates.dt.year.value_counts().sort_index()
+                neg_year_counts = neg_dates.dt.year.value_counts().sort_index()
+                
+                print(f"     正样本年份分布: {dict(pos_year_counts)}")
+                print(f"     负样本年份分布: {dict(neg_year_counts)}")
+                
+                # 计算时间匹配度
+                all_months = sorted(set(pos_month_counts.index).union(set(neg_month_counts.index)))
+                pos_month_props = pos_month_counts / pos_month_counts.sum()
+                neg_month_props = neg_month_counts / neg_month_counts.sum()
+                
+                # 计算月份分布匹配度
+                match_scores = []
+                for month in all_months:
+                    pos_prop = pos_month_props.get(month, 0)
+                    neg_prop = neg_month_props.get(month, 0)
+                    match_score = 1 - abs(pos_prop - neg_prop)
+                    match_scores.append(match_score)
+                
+                avg_match_score = np.mean(match_scores)
+                print(f"     月份分布平均匹配度: {avg_match_score:.3f} (1.0表示完全匹配)")
+            
+            # 创建比例专属目录
+            ratio_dir = os.path.join(BASE_DIR, f"ratio_{ratio_str}")
+            os.makedirs(ratio_dir, exist_ok=True)
+            
+            # 保存数据
+            data_path = os.path.join(ratio_dir, f"balanced_ratio_{ratio_str}.csv")
+            balanced_data.to_csv(data_path, index=False, encoding='gbk')
+            print(f"💾 数据已保存: {data_path}")
+            
+            # 可视化
+            img_path = os.path.join(ratio_dir, f"comparison_ratio_{ratio_str}.png")
+            plot_comparison(
+                original=filtered,
+                balanced=balanced_data,
+                admin=admin,
+                vulnerability=vulnerability,
+                save_path=img_path,
+                ratio=ratio
+            )
+            
+        except Exception as e:
+            print(f"❌ 处理比例1:{ratio}时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    print(f"\n✅ 所有处理完成！结果保存在: {BASE_DIR}")
+    
+    # 最终统计
+    print("\n📊 最终统计:")
+    for ratio in TARGET_RATIOS:
+        ratio_str = f"1_{ratio}"
+        data_path = os.path.join(BASE_DIR, f"ratio_{ratio_str}", f"balanced_ratio_{ratio_str}.csv")
+        if os.path.exists(data_path):
+            df = pd.read_csv(data_path, encoding='gbk')
+            df['日期'] = pd.to_datetime(df['日期'])
+            pos = df[df['target']==1]
+            neg = df[df['target']==0]
+            
+            print(f"   比例1:{ratio}:")
+            print(f"     正样本={len(pos)}, 负样本={len(neg)}, 实际比例=1:{len(neg)/len(pos):.1f}")
+            print(f"     时间完全匹配: 是")
+            
+            # 检查是否有相同的日期
+            common_dates = set(pos['日期']).intersection(set(neg['日期']))
+            print(f"     共同日期数量: {len(common_dates)} (占总日期数的{len(common_dates)/len(set(pos['日期'])):.1%})")
+
+
+if __name__ == "__main__":
+    main()
