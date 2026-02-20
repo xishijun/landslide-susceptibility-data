@@ -3,7 +3,7 @@
 This project implements the complete workflow described in the paper:
 
 > **A Novel Three‑Layer Stacking Ensemble with Geological‑Mechanism Constrained Sampling for Interpretable Landslide Susceptibility Modeling**  
-> Shijun Xi, Jian Xiao, Lin Zen, Liping Teng, Tao Luo, Hongzuan Chen  
+> Shijun Xi, Jian Xiao, Lin Zen, Tao Luo
 
 
 The repository contains a full implementation of three stacking ensemble algorithms, a unified data preprocessor, model evaluation and comparison tools, uncertainty analysis modules, and prediction utilities.
