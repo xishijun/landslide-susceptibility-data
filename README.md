@@ -258,17 +258,7 @@ shap.summary_plot(shap_values, pipeline.meta_features_test)
 
 ## 7. Citation & Contact
 
-If you use this code in your research, please cite our paper:
-
-```bibtex
-@article{xi2025three,
-  title={A Novel Three-Layer Stacking Ensemble with Geological-Mechanism Constrained Sampling for Interpretable Landslide Susceptibility Modeling},
-  author={Xi, Shijun and Xiao, Jian and Zen, Lin and Teng, Liping and Luo, Tao and Chen, Hongzuan},
-  journal={Computers \& Geosciences},
-  year={2025},
-  note={Under review}
-}
-```
+If you use this code in your research:
 
 The code is available at: [https://github.com/xishijun/landslide-susceptibility-data/tree/main))] 
 For questions or collaborations, contact the corresponding author: **Shijun Xi** (📧 m19984468477@163.com)
