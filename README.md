@@ -4,7 +4,7 @@ This project implements the complete workflow described in the paper:
 
 > **A Novel Three‑Layer Stacking Ensemble with Geological‑Mechanism Constrained Sampling for Interpretable Landslide Susceptibility Modeling**  
 > Shijun Xi, Jian Xiao, Lin Zen, Liping Teng, Tao Luo, Hongzuan Chen  
-> *Submitted to Computers & Geosciences* (2025)
+> 
 
 The repository contains two core scripts:
 
@@ -270,7 +270,7 @@ If you use this code in your research, please cite our paper:
 }
 ```
 
-The code is available at: [https://github.com/H432830/Susceptibility-mapping](https://github.com/H432830/Susceptibility-mapping)  
+The code is available at: [https://github.com/xishijun/landslide-susceptibility-data/tree/main))] 
 For questions or collaborations, contact the corresponding author: **Shijun Xi** (📧 m19984468477@163.com)
 
 ---
